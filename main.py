@@ -2,13 +2,14 @@ import numpy as np
 from tensorflow import keras
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from PIL import Image
-from urllib import request
 from io import BytesIO
 import faiss
 import json
 import copy
+import time
+import aiohttp
+from aiohttp.client import ClientSession
 import asyncio
-import concurrent.futures
 import nest_asyncio
 nest_asyncio.apply()
 
@@ -23,6 +24,7 @@ class Rearranger:
         self.index = None
         self.candidates = None
         self.length = None
+        self.loop = asyncio.new_event_loop()
 
     def init_model(self) -> None:
         # vgg16_model = keras.applications.vgg16.VGG16(
@@ -56,32 +58,24 @@ class Rearranger:
         self.length = len(candidates)
         candidateVectors = np.empty([self.length, 1000])
 
-        def vectorize_remote_image(index):
-            url = candidates[index]["image"]
-            res = request.urlopen(url).read()
-            img = Image.open(BytesIO(res)).resize((224, 224))
-            x = keras.preprocessing.image.img_to_array(img)
-            x = np.expand_dims(x, axis=0)
-            x = keras.applications.mobilenet_v3.preprocess_input(x)
-            features = self.model.predict(x)
-            candidateVectors[index] = features
+        async def vectorize_remote_image(index, session: ClientSession):
+            async with session.get(url=candidates[index]["image"]) as response:
+                res = await response.read()
+                img = Image.open(BytesIO(res)).resize((224, 224))
+                x = keras.preprocessing.image.img_to_array(img)
+                x = np.expand_dims(x, axis=0)
+                x = keras.applications.mobilenet_v3.preprocess_input(x)
+                features = self.model.predict(x)
+                candidateVectors[index] = features
 
-        async def asynchronous_requests():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.length) as executor:
-                loop = asyncio.get_event_loop()
-                futures = [
-                    loop.run_in_executor(
-                        executor,
-                        vectorize_remote_image,
-                        i
-                    )
-                    for i in range(self.length)
-                ]
-                for _ in await asyncio.gather(*futures):
-                    pass
+        async def batch_requests():
+            async with aiohttp.ClientSession() as session:
+                tasks = [vectorize_remote_image(
+                    index=i, session=session) for i in range(self.length)]
+                # the await must be nest inside of the session
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(asynchronous_requests())
+        self.loop.run_until_complete(batch_requests())
 
         index.add(candidateVectors)
 
@@ -129,11 +123,13 @@ async def rearrange(
     target: UploadFile = File()
 ):
     try:
+        start_time = time.time()
         candidates = json.loads(candidates)
         rearranger.faiss_index(candidates["candidates"])
         target_content = await target.read()
         result = rearranger.faiss_search(target_content)
 
+        print(f"time cost: {time.time() - start_time}s")
         return {
             "result": result,
         }
